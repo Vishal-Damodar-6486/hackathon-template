@@ -1,16 +1,41 @@
-import os
-from dotenv import load_dotenv
 import streamlit as st
+from pdfminer.high_level import extract_text
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+import tempfile
+import os
+import httpx
+import tiktoken
+import requests
+
 
 from langchain.schema import AIMessage, HumanMessage
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.callbacks.base import BaseCallbackHandler
+import httpx
 
-load_dotenv()
+# Create HTTP client with verify=False for LangChain
+client = httpx.Client(verify=False)
+
+# === Monkeypatch requests to disable SSL verification globally ===
+for method in ("get", "post", "put", "delete", "head", "options", "patch"):
+    original = getattr(requests, method)
+
+    def insecure_request(*args, _original=original, **kwargs):
+        kwargs["verify"] = False
+        return _original(*args, **kwargs)
+
+    setattr(requests, method, insecure_request)
+
+# Set tiktoken cache dir
+tiktoken_cache_dir = "./token"
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
 
 # -------------------------
 # Custom Streaming Callback Handler
@@ -33,22 +58,32 @@ def extract_text(file_path):
     return loader.load_and_split()
 
 def get_embeddings():
-    return AzureOpenAIEmbeddings(
-        model=os.getenv("AZURE_LLMsOpenAI_EMBEDDINGS_DEPLOYMENT_NAME"),
-        azure_endpoint=os.getenv("AZURE_LLMsOpenAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_LLMsOpenAI_API_KEY"),
-        openai_api_version=os.getenv("AZURE_LLMsOpenAI_API_VERSION")
-    )
+    return OpenAIEmbeddings(
+        base_url="https://genailab.tcs.in",
+        model="azure/genailab-maas-text-embedding-3-large",
+        api_key="sk-g0RigALF05KUmlonLK3JHg",
+        http_client=client,
+        )
+
 
 def get_vector_store(docs):
     embeddings = get_embeddings()
-    vector_store = FAISS.from_documents(documents=docs, embedding=embeddings)
-    vector_store.save_local('faiss_index')
+    # vector_store = FAISS.from_documents(documents=docs, embedding=embeddings)
+    # vector_store.save_local('faiss_index')
+    vector_store = Chroma.from_documents(documents=docs, embedding=embeddings, persist_directory="./chroma_index")
+    vector_store.persist()
+    return vector_store
+    
 
 def get_vector_store_retriever():
     embeddings = get_embeddings()
     try:
-        db = FAISS.load_local('faiss_index', embeddings, allow_dangerous_deserialization=True)
+        # db = FAISS.load_local('faiss_index', embeddings, allow_dangerous_deserialization=True)
+        # Initialize the embedding model
+        embedding_model = get_embeddings()
+
+        # Load the persisted vector store
+        db = Chroma(persist_directory="./chroma_index", embedding_function=embedding_model)
         return db.as_retriever(search_type="similarity", search_kwargs={"k": 20}, verbose=True)
     except Exception:
         return None
@@ -83,16 +118,11 @@ def get_conversational_chain(callbacks=None):
             """
     )
     output_parser = StrOutputParser()
-    llm = AzureChatOpenAI(
-        openai_api_key=os.getenv("AZURE_LLMsOpenAI_API_KEY"),
-        openai_api_version=os.getenv("AZURE_LLMsOpenAI_API_VERSION"),
-        azure_deployment=os.getenv("AZURE_LLMsOpenAI_GPT4O_DEPLOYMENT_NAME"),
-        azure_endpoint=os.getenv("AZURE_LLMsOpenAI_ENDPOINT"),
-        temperature=0.2,
-        top_p=0.7,
-        max_tokens=4096,
-        streaming=True,
-        callbacks=callbacks
+    llm = ChatOpenAI(
+    base_url="https://genailab.tcs.in",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key="sk-g0RigALF05KUmlonLK3JHg",
+    http_client=client,
     )
     chain = prompt | llm | output_parser
     return chain
